@@ -1,0 +1,73 @@
+name: Sync Upstream
+on:
+  workflow_dispatch:
+permissions:
+  actions: write
+  contents: write
+concurrency:
+  group: cloud-mail-sync
+  cancel-in-progress: false
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Require a main-branch dispatch
+        env:
+          DISPATCH_REF: ${{ github.ref }}
+        run: |
+          test "$DISPATCH_REF" = "refs/heads/main" || {
+            echo "::error::Sync must be dispatched from main"
+            exit 1
+          }
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: true
+      - name: Rebase the single fork commit onto upstream
+        id: sync
+        shell: bash
+        run: |
+          set -euo pipefail
+          current=$(git rev-parse HEAD)
+          base=$(git rev-parse HEAD^)
+          git fetch --no-tags https://github.com/maillab/cloud-mail.git main:refs/remotes/upstream/main
+          upstream=$(git rev-parse upstream/main)
+          git merge-base --is-ancestor "$base" upstream/main || {
+            echo "::error::Upstream history was rewritten; refusing to update main"
+            exit 1
+          }
+          test "$(git rev-list --count upstream/main..HEAD)" -eq 1 || {
+            echo "::error::Fork must contain exactly one commit beyond upstream"
+            exit 1
+          }
+          current_workflows=$(git ls-tree -r --name-only "$base" -- .github/workflows)
+          upstream_workflows=$(git ls-tree -r --name-only "$upstream" -- .github/workflows)
+          test "$current_workflows" = "$upstream_workflows" || {
+            echo "::error::Upstream workflow files changed; review them before syncing"
+            echo "Current upstream workflow files:"
+            printf '%s\n' "$current_workflows"
+            echo "New upstream workflow files:"
+            printf '%s\n' "$upstream_workflows"
+            exit 1
+          }
+          if test "$base" = "$upstream"; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "Already synchronized with upstream; skipping publish"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git rebase upstream/main
+          test "$(git rev-parse HEAD^)" = "$upstream" || {
+            echo "::error::Rebase did not preserve the single-commit fork layout"
+            exit 1
+          }
+          git push --force-with-lease="refs/heads/main:$current" origin HEAD:refs/heads/main
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+      - name: Start guarded publish
+        if: steps.sync.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run publish.yml --ref main
